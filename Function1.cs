@@ -26,7 +26,7 @@ public class Function1(ILogger<Function1> logger)
 
         // Read the request body for header information
         string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
-        logger.LogInformation("Request body: {requestBody}", requestBody);
+        logger.LogInformation($"Request body: {requestBody}");
 
         // Check if we need to handle callback
         var planUrl = req.Headers["PlanUrl"].ToString();
@@ -73,6 +73,8 @@ public class Function1(ILogger<Function1> logger)
             // Create timeline record update
             var timelineRecord = new
             {
+                id = taskInstanceId,
+                state = "completed",
                 result = "succeeded", // or "failed"
                 resultCode = JsonSerializer.Serialize(new
                 {
@@ -81,40 +83,52 @@ public class Function1(ILogger<Function1> logger)
                 })
             };
 
-            // Convert to JSON string
-            var jsonContent = JsonSerializer.Serialize(timelineRecord);
-
-            // Set timeline variable
-            var variableName = $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}";
-            var variableValue = jsonContent;
-
-            // Create patch document to update variable
-            var patchDocument = new[]
+            // Create the payload with the timeline record array
+            var payload = new
             {
-                new
-                {
-                    op = "add",
-                    path = $"/variables/{variableName}",
-                    value = variableValue
-                }
+                value = new[] { timelineRecord },
+                count = 1
             };
 
-            // Set up the request
-            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/jobs/{jobId}/variables?api-version=5.1-preview.1";
+            // Convert to JSON string
+            var jsonContent = JsonSerializer.Serialize(payload);
+            logger.LogInformation($"Callback payload: {jsonContent}");
+
+            // Set up the request - using the records update API
+            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=7.1";
 
             logger.LogInformation($"Callback URL: {url}");
 
-            var content = new StringContent(JsonSerializer.Serialize(patchDocument), Encoding.UTF8, "application/json-patch+json");
+            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
             // Add authorization header
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
 
-            // Send the request
-            var response = await httpClient.PatchAsync(url, content);
+            // Send the request - using PATCH method
+            var request = new HttpRequestMessage(new HttpMethod("PATCH"), url)
+            {
+                Content = content
+            };
+
+            var response = await httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
             {
                 logger.LogInformation("Callback sent successfully!");
+
+                // Now set the task variable for compatibility with the CallbackHandler
+                var variableName = $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}";
+                var variableValue = JsonSerializer.Serialize(new
+                {
+                    result = "succeeded",
+                    resultCode = JsonSerializer.Serialize(new
+                    {
+                        status = "success",
+                        message = "Function completed successfully!"
+                    })
+                });
+
+                await SetTaskVariable(planUrl, projectId, hubName, planId, jobId, variableName, variableValue, authToken);
             }
             else
             {
@@ -127,6 +141,61 @@ public class Function1(ILogger<Function1> logger)
         {
             logger.LogError($"Error sending callback: {ex.Message}");
             logger.LogError(ex.StackTrace);
+        }
+    }
+
+    private async Task SetTaskVariable(
+        string planUrl, string projectId, string hubName,
+        string planId, string jobId, string variableName,
+        string variableValue, string authToken)
+    {
+        try
+        {
+            // Create patch document to update variable
+            var patchDocument = new[]
+            {
+                new
+                {
+                    op = "add",
+                    path = $"/variables/{variableName}",
+                    value = variableValue
+                }
+            };
+
+            // Set up the request for the variables API
+            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/jobs/{jobId}/variables?api-version=7.1";
+
+            logger.LogInformation($"Variable URL: {url}");
+
+            var content = new StringContent(JsonSerializer.Serialize(patchDocument), Encoding.UTF8, "application/json-patch+json");
+
+            // Add authorization header
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+
+            // Send the PATCH request
+            var request = new HttpRequestMessage(new HttpMethod("PATCH"), url)
+            {
+                Content = content
+            };
+
+            var response = await httpClient.SendAsync(request);
+
+            if (response.IsSuccessStatusCode)
+            {
+                logger.LogInformation($"Task variable '{variableName}' set successfully!");
+            }
+            else
+            {
+                logger.LogWarning($"Failed to set task variable with status code: {response.StatusCode}");
+                var responseContent = await response.Content.ReadAsStringAsync();
+                logger.LogWarning($"Response content: {responseContent}");
+                logger.LogInformation("This is expected if the variables API is not available, but the callback should still work through the timeline record update.");
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning($"Error setting task variable: {ex.Message}");
+            logger.LogWarning("This is not critical as the main callback was already sent through timeline records update.");
         }
     }
 }
