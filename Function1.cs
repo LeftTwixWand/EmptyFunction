@@ -70,24 +70,43 @@ public class Function1(ILogger<Function1> _logger)
         {
             _logger.LogInformation($"Sending callback for task: {taskInstanceId}");
 
-            // Create timeline record update
+            // Create the callback result data that's expected by the CallbackHandler
+            var callbackData = JsonSerializer.Serialize(new
+            {
+                result = "succeeded",
+                resultCode = JsonSerializer.Serialize(new
+                {
+                    status = "success",
+                    message = "Function completed successfully!"
+                })
+            });
+
+            // Create a variable dictionary to include in the record
+            var variables = new Dictionary<string, object>
+            {
+                // This is the key - include the variable directly in the record
+                // The name must match what the CallbackHandler is looking for
+                { $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}", new { value = callbackData, isSecret = false } }
+            };
+
+            // Create timeline record update with the variables
             var timelineRecord = new
             {
                 id = taskInstanceId,
                 state = "completed",
-                result = "succeeded", // or "failed"
+                result = "succeeded",
                 resultCode = JsonSerializer.Serialize(new
                 {
                     status = "success",
                     message = "Function completed successfully!",
-                    completeTask = true  // Signal to explicitly complete the task
+                    completeTask = true
                 }),
-                // Include additional fields to ensure task completion
                 percentComplete = 100,
-                finishTime = DateTime.UtcNow.ToString("o") // ISO 8601 format
+                finishTime = DateTime.UtcNow.ToString("o"),
+                variables = variables // Add variables directly to the timeline record
             };
 
-            // Create the payload with the timeline record array
+            // Create the payload with the timeline record
             var payload = new
             {
                 value = new[] { timelineRecord },
@@ -118,22 +137,7 @@ public class Function1(ILogger<Function1> _logger)
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation("Callback sent successfully!");
-
-                // Now set the task variable for compatibility with the CallbackHandler
-                var variableName = $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}";
-                var variableValue = JsonSerializer.Serialize(new
-                {
-                    result = "succeeded",
-                    resultCode = JsonSerializer.Serialize(new
-                    {
-                        status = "success",
-                        message = "Function completed successfully!"
-                    })
-                });
-
-                // Actually set the task variable
-                await SetTaskVariableAsync(planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, variableName, variableValue, authToken);
+                _logger.LogInformation("Callback sent successfully with variable included in timeline record!");
             }
             else
             {
@@ -145,64 +149,6 @@ public class Function1(ILogger<Function1> _logger)
         catch (Exception ex)
         {
             _logger.LogError($"Error sending callback: {ex.Message}");
-            _logger.LogError(ex.StackTrace);
-        }
-    }
-
-    private async Task SetTaskVariableAsync(
-        string planUrl, string projectId, string hubName,
-        string planId, string jobId, string timelineId,
-        string taskInstanceId, string variableName, string variableValue, string authToken)
-    {
-        try
-        {
-            _logger.LogInformation($"Setting task variable: {variableName}");
-
-            // Create the variables payload
-            var variablePayload = new
-            {
-                variables = new Dictionary<string, object>
-                {
-                    { variableName, new { value = variableValue, isSecret = false } }
-                }
-            };
-
-            var jsonContent = JsonSerializer.Serialize(variablePayload);
-            _logger.LogInformation($"Variable payload: {jsonContent}");
-
-            // Set up the request - using the task variables API
-            // Note: This endpoint adds variables to the timeline record for this task
-            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/jobs/{jobId}/records?api-version=7.1";
-
-            _logger.LogInformation($"Variables API URL: {url}");
-
-            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-
-            // Add authorization header
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
-
-            // Send the request - using PATCH method
-            var request = new HttpRequestMessage(new HttpMethod("PATCH"), url)
-            {
-                Content = content
-            };
-
-            var response = await httpClient.SendAsync(request);
-
-            if (response.IsSuccessStatusCode)
-            {
-                _logger.LogInformation("Task variable set successfully!");
-            }
-            else
-            {
-                _logger.LogError($"Failed to set task variable: {response.StatusCode}");
-                var responseContent = await response.Content.ReadAsStringAsync();
-                _logger.LogError($"Response content: {responseContent}");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError($"Error setting task variable: {ex.Message}");
             _logger.LogError(ex.StackTrace);
         }
     }
