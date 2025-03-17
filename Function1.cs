@@ -70,8 +70,34 @@ public class Function1(ILogger<Function1> _logger)
         {
             _logger.LogInformation($"Sending callback for task: {taskInstanceId}");
 
-            // Create the callback result data that's expected by the CallbackHandler
-            var callbackData = JsonSerializer.Serialize(new
+            // Create two separate timeline records:
+            // 1. First, update a job-level record with our variable
+            // 2. Then, update the task-level record to mark it as complete
+
+            // First, update the job record with our variable
+            await SetJobVariableAsync(planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, authToken);
+
+            // Then, mark the task as complete
+            await UpdateTaskRecordAsync(planUrl, projectId, hubName, planId, timelineId, taskInstanceId, authToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error sending callback: {ex.Message}");
+            _logger.LogError(ex.StackTrace);
+        }
+    }
+
+    private async Task SetJobVariableAsync(
+        string planUrl, string projectId, string hubName,
+        string planId, string jobId, string timelineId,
+        string taskInstanceId, string authToken)
+    {
+        try
+        {
+            _logger.LogInformation($"Setting job-level variable for callback: {taskInstanceId}");
+
+            // Format the variable value exactly as expected by CallbackHandler
+            string variableValue = JsonSerializer.Serialize(new
             {
                 result = "succeeded",
                 resultCode = JsonSerializer.Serialize(new
@@ -81,46 +107,42 @@ public class Function1(ILogger<Function1> _logger)
                 })
             });
 
-            // Create a variable dictionary to include in the record
+            // Create a variables dictionary using the exact VariableValue structure
+            // from the Azure DevOps API documentation
             var variables = new Dictionary<string, object>
             {
-                // This is the key - include the variable directly in the record
-                // The name must match what the CallbackHandler is looking for
-                { $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}", new { value = callbackData, isSecret = false } }
-            };
-
-            // Create timeline record update with the variables
-            var timelineRecord = new
-            {
-                id = taskInstanceId,
-                state = "completed",
-                result = "succeeded",
-                resultCode = JsonSerializer.Serialize(new
                 {
-                    status = "success",
-                    message = "Function completed successfully!",
-                    completeTask = true
-                }),
-                percentComplete = 100,
-                finishTime = DateTime.UtcNow.ToString("o"),
-                variables = variables // Add variables directly to the timeline record
+                    $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}",
+                    new
+                    {
+                        value = variableValue,
+                        isSecret = false
+                    }
+                }
             };
 
-            // Create the payload with the timeline record
+            // Create a record update for the job record
+            var jobRecord = new
+            {
+                id = jobId, // Important! Use the jobId here, not taskInstanceId
+                variables = variables
+            };
+
+            // Create the payload with just the variables update
             var payload = new
             {
-                value = new[] { timelineRecord },
+                value = new[] { jobRecord },
                 count = 1
             };
 
             // Convert to JSON string
             var jsonContent = JsonSerializer.Serialize(payload);
-            _logger.LogInformation($"Callback payload: {jsonContent}");
+            _logger.LogInformation($"Job variable payload: {jsonContent}");
 
             // Set up the request - using the records update API
             var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=7.1";
 
-            _logger.LogInformation($"Callback URL: {url}");
+            _logger.LogInformation($"Job variable URL: {url}");
 
             var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
@@ -137,18 +159,90 @@ public class Function1(ILogger<Function1> _logger)
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation("Callback sent successfully with variable included in timeline record!");
+                _logger.LogInformation("Job variable set successfully!");
             }
             else
             {
-                _logger.LogError($"Callback failed with status code: {response.StatusCode}");
+                _logger.LogError($"Job variable update failed with status code: {response.StatusCode}");
                 var responseContent = await response.Content.ReadAsStringAsync();
                 _logger.LogError($"Response content: {responseContent}");
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError($"Error sending callback: {ex.Message}");
+            _logger.LogError($"Error setting job variable: {ex.Message}");
+            _logger.LogError(ex.StackTrace);
+        }
+    }
+
+    private async Task UpdateTaskRecordAsync(
+        string planUrl, string projectId, string hubName,
+        string planId, string timelineId,
+        string taskInstanceId, string authToken)
+    {
+        try
+        {
+            _logger.LogInformation($"Updating task record as complete: {taskInstanceId}");
+
+            // Create timeline record update for the task
+            var taskRecord = new
+            {
+                id = taskInstanceId,
+                state = "completed",
+                result = "succeeded",
+                resultCode = JsonSerializer.Serialize(new
+                {
+                    status = "success",
+                    message = "Function completed successfully!",
+                    completeTask = true
+                }),
+                percentComplete = 100,
+                finishTime = DateTime.UtcNow.ToString("o")
+            };
+
+            // Create the payload with the task record update
+            var payload = new
+            {
+                value = new[] { taskRecord },
+                count = 1
+            };
+
+            // Convert to JSON string
+            var jsonContent = JsonSerializer.Serialize(payload);
+            _logger.LogInformation($"Task record payload: {jsonContent}");
+
+            // Set up the request - using the records update API
+            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=7.1";
+
+            _logger.LogInformation($"Task record URL: {url}");
+
+            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+            // Add authorization header
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+
+            // Send the request - using PATCH method
+            var request = new HttpRequestMessage(new HttpMethod("PATCH"), url)
+            {
+                Content = content
+            };
+
+            var response = await httpClient.SendAsync(request);
+
+            if (response.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("Task record updated successfully!");
+            }
+            else
+            {
+                _logger.LogError($"Task record update failed with status code: {response.StatusCode}");
+                var responseContent = await response.Content.ReadAsStringAsync();
+                _logger.LogError($"Response content: {responseContent}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error updating task record: {ex.Message}");
             _logger.LogError(ex.StackTrace);
         }
     }
