@@ -132,7 +132,8 @@ public class Function1(ILogger<Function1> _logger)
                     })
                 });
 
-                await SetTaskVariable(planUrl, projectId, hubName, planId, jobId, variableName, variableValue, authToken);
+                // Actually set the task variable
+                await SetTaskVariableAsync(planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, variableName, variableValue, authToken);
             }
             else
             {
@@ -148,35 +149,39 @@ public class Function1(ILogger<Function1> _logger)
         }
     }
 
-    private async Task SetTaskVariable(
+    private async Task SetTaskVariableAsync(
         string planUrl, string projectId, string hubName,
-        string planId, string jobId, string variableName,
-        string variableValue, string authToken)
+        string planId, string jobId, string timelineId,
+        string taskInstanceId, string variableName, string variableValue, string authToken)
     {
         try
         {
-            // Create patch document to update variable
-            var patchDocument = new[]
+            _logger.LogInformation($"Setting task variable: {variableName}");
+
+            // Create the variables payload
+            var variablePayload = new
             {
-                new
+                variables = new Dictionary<string, object>
                 {
-                    op = "add",
-                    path = $"/variables/{variableName}",
-                    value = variableValue
+                    { variableName, new { value = variableValue, isSecret = false } }
                 }
             };
 
-            // Set up the request for the variables API
-            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/jobs/{jobId}/variables?api-version=7.1";
+            var jsonContent = JsonSerializer.Serialize(variablePayload);
+            _logger.LogInformation($"Variable payload: {jsonContent}");
 
-            _logger.LogInformation($"Variable URL: {url}");
+            // Set up the request - using the task variables API
+            // Note: This endpoint adds variables to the timeline record for this task
+            var url = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/jobs/{jobId}/records?api-version=7.1";
 
-            var content = new StringContent(JsonSerializer.Serialize(patchDocument), Encoding.UTF8, "application/json-patch+json");
+            _logger.LogInformation($"Variables API URL: {url}");
+
+            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
             // Add authorization header
             httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
 
-            // Send the PATCH request
+            // Send the request - using PATCH method
             var request = new HttpRequestMessage(new HttpMethod("PATCH"), url)
             {
                 Content = content
@@ -186,20 +191,19 @@ public class Function1(ILogger<Function1> _logger)
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation($"Task variable '{variableName}' set successfully!");
+                _logger.LogInformation("Task variable set successfully!");
             }
             else
             {
-                _logger.LogWarning($"Failed to set task variable with status code: {response.StatusCode}");
+                _logger.LogError($"Failed to set task variable: {response.StatusCode}");
                 var responseContent = await response.Content.ReadAsStringAsync();
-                _logger.LogWarning($"Response content: {responseContent}");
-                _logger.LogInformation("This is expected if the variables API is not available, but the callback should still work through the timeline record update.");
+                _logger.LogError($"Response content: {responseContent}");
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning($"Error setting task variable: {ex.Message}");
-            _logger.LogWarning("This is not critical as the main callback was already sent through timeline records update.");
+            _logger.LogError($"Error setting task variable: {ex.Message}");
+            _logger.LogError(ex.StackTrace);
         }
     }
 }
