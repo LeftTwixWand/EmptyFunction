@@ -48,7 +48,7 @@ public class Function1(ILogger<Function1> _logger)
             _logger.LogInformation("Starting callback process...");
 
             // Simulate some work
-            await Task.Delay(3000); // 3 seconds delay to simulate work
+            await Task.Delay(2000); // 2 seconds delay to simulate work
 
             // Call back to update the task status
             await ProcessTaskCallbackAsync(planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, authToken);
@@ -72,27 +72,44 @@ public class Function1(ILogger<Function1> _logger)
         {
             _logger.LogInformation($"Processing callback for task: {taskInstanceId}");
 
-            // 1. First, send task started event
-            await SendTaskStartedEventAsync(planUrl, projectId, hubName, planId, jobId, taskInstanceId, authToken);
-
-            // 2. Send a log feed indicating we're starting
+            // 1. Send a log feed indicating we're starting
             await SendTaskLogFeedAsync(planUrl, projectId, hubName, planId, jobId, timelineId, "Function processing started", authToken);
 
-            // 3. Do your work
+            // 2. Do your work
             _logger.LogInformation("Performing function work...");
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 2; i++)
             {
-                await SendTaskLogFeedAsync(planUrl, projectId, hubName, planId, jobId, timelineId, $"Processing step {i + 1}/3", authToken);
+                await SendTaskLogFeedAsync(planUrl, projectId, hubName, planId, jobId, timelineId, $"Processing step {i + 1}/2", authToken);
                 await Task.Delay(1000); // Simulate work
             }
 
-            // 4. Set the callback variable (optional but useful for backward compatibility)
-            await SetCallbackVariableAsync(planUrl, projectId, hubName, planId, timelineId, taskInstanceId, jobId, authToken);
+            // 3. Set the callback variable directly on the task instance
+            string callbackData = JsonConvert.SerializeObject(new
+            {
+                result = "succeeded",
+                resultCode = JsonConvert.SerializeObject(new
+                {
+                    status = "success",
+                    message = "Function completed successfully!"
+                })
+            });
 
-            // 5. Send task completed event (this is the critical part)
-            await SendTaskCompletedEventAsync(planUrl, projectId, hubName, planId, jobId, taskInstanceId, "succeeded", authToken);
+            // This is the variable the callback handler is looking for
+            await SetTaskVariableAsync(
+                planUrl, projectId, hubName, planId, timelineId, taskInstanceId,
+                $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}", callbackData, false, authToken);
 
-            // 6. Send a final log message
+            // Also set a system variable as a backup mechanism
+            await SetTaskVariableAsync(
+                planUrl, projectId, hubName, planId, timelineId, taskInstanceId,
+                "SYSTEM_TASKISCOMPLETED", "true", false, authToken);
+
+            // Set one more backup variable
+            await SetTaskVariableAsync(
+                planUrl, projectId, hubName, planId, timelineId, taskInstanceId,
+                "VSTS_CALLBACK_COMPLETE", "true", false, authToken);
+
+            // 4. Send a final log message
             await SendTaskLogFeedAsync(planUrl, projectId, hubName, planId, jobId, timelineId, "Function processing completed", authToken);
 
             _logger.LogInformation("Task callback processing finished successfully");
@@ -102,65 +119,17 @@ public class Function1(ILogger<Function1> _logger)
             _logger.LogError($"Error during callback processing: {ex.Message}");
             _logger.LogError(ex.StackTrace);
 
-            // If there's an error, try to mark the task as failed
+            // If there's an error, try to log it
             try
             {
-                await SendTaskCompletedEventAsync(planUrl, projectId, hubName, planId, jobId, taskInstanceId, "failed", authToken);
                 await SendTaskLogFeedAsync(planUrl, projectId, hubName, planId, jobId, timelineId, $"Error: {ex.Message}", authToken);
             }
             catch
             {
-                // Just log any errors from the failure notification
-                _logger.LogError("Failed to send task failure notification");
+                // Just log if this also fails
+                _logger.LogError("Failed to send error log");
             }
         }
-    }
-
-    private async Task SendTaskStartedEventAsync(
-        string planUrl, string projectId, string hubName,
-        string planId, string jobId, string taskInstanceId,
-        string authToken)
-    {
-        _logger.LogInformation($"Sending TaskStarted event for task: {taskInstanceId}");
-
-        // Task Event URL: {planUri}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/events?api-version=2.0-preview.1
-        string taskEventUrl = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/events?api-version=2.0-preview.1";
-
-        // Create the event payload
-        var requestBodyJObject = new JObject(
-            new JProperty("name", "TaskStarted"),
-            new JProperty("jobId", jobId),
-            new JProperty("taskId", taskInstanceId)
-        );
-
-        string requestBody = JsonConvert.SerializeObject(requestBodyJObject);
-        _logger.LogInformation($"TaskStarted event payload: {requestBody}");
-
-        await PostDataAsync(taskEventUrl, requestBody, authToken);
-    }
-
-    private async Task SendTaskCompletedEventAsync(
-        string planUrl, string projectId, string hubName,
-        string planId, string jobId, string taskInstanceId,
-        string result, string authToken)
-    {
-        _logger.LogInformation($"Sending TaskCompleted event for task: {taskInstanceId}, result: {result}");
-
-        // Task Event URL: {planUri}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/events?api-version=2.0-preview.1 
-        string taskEventUrl = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/events?api-version=2.0-preview.1";
-
-        // Create the event payload
-        var requestBodyJObject = new JObject(
-            new JProperty("name", "TaskCompleted"),
-            new JProperty("jobId", jobId),
-            new JProperty("taskId", taskInstanceId),
-            new JProperty("result", result)  // "succeeded" or "failed"
-        );
-
-        string requestBody = JsonConvert.SerializeObject(requestBodyJObject);
-        _logger.LogInformation($"TaskCompleted event payload: {requestBody}");
-
-        await PostDataAsync(taskEventUrl, requestBody, authToken);
     }
 
     private async Task SendTaskLogFeedAsync(
@@ -186,81 +155,89 @@ public class Function1(ILogger<Function1> _logger)
         await PostDataAsync(taskFeedUrl, requestBody, authToken);
     }
 
-    private async Task SetCallbackVariableAsync(
+    private async Task SetTaskVariableAsync(
         string planUrl, string projectId, string hubName,
         string planId, string timelineId, string taskInstanceId,
-        string jobId, string authToken)
+        string variableName, string variableValue, bool isSecret,
+        string authToken)
     {
         try
         {
-            _logger.LogInformation($"Setting callback variable for task: {taskInstanceId}");
+            _logger.LogInformation($"Setting task variable: {variableName}");
 
-            // Format the callback data
-            string callbackData = JsonConvert.SerializeObject(new
-            {
-                result = "succeeded",
-                resultCode = JsonConvert.SerializeObject(new
-                {
-                    status = "success",
-                    message = "Function completed successfully!"
-                })
-            });
-
-            // First, get the existing timeline records
+            // Get timeline records
             string timelineRecordsUrl = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=4.1";
-            var response = await GetDataAsync(timelineRecordsUrl, authToken);
-            var responseContent = await response.Content.ReadAsStringAsync();
 
+            var response = await GetDataAsync(timelineRecordsUrl, authToken);
             if (response.IsSuccessStatusCode)
             {
-                // Parse the response
-                dynamic timelineRecordsData = JsonConvert.DeserializeObject(responseContent);
+                var timelineRecords = await response.Content.ReadAsStringAsync();
+                dynamic timelineRecordsData = JsonConvert.DeserializeObject(timelineRecords);
+                JObject taskRecord = null;
 
-                // Find the job record and update it
-                foreach (var record in timelineRecordsData.value)
+                // First get all the records
+                foreach (var record in timelineRecordsData["value"])
                 {
                     string recordId = record.id.ToString();
-                    if (string.Equals(recordId, jobId, StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(recordId, taskInstanceId, StringComparison.OrdinalIgnoreCase))
                     {
-                        // Create a JObject for the job record
-                        JObject timelineRecord = JObject.FromObject(record);
-
-                        // Add or update the variables property
-                        if (timelineRecord["variables"] == null)
-                        {
-                            timelineRecord["variables"] = new JObject();
-                        }
-
-                        // Set our callback variable
-                        JObject variables = (JObject)timelineRecord["variables"];
-                        string varName = $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}";
-                        variables[varName] = new JObject(
-                            new JProperty("value", callbackData),
-                            new JProperty("isSecret", false)
-                        );
-
-                        // Create the update payload
-                        JArray updatedRecords = new JArray();
-                        updatedRecords.Add(timelineRecord);
-
-                        var requestBodyJObject = new JObject(
-                            new JProperty("value", updatedRecords),
-                            new JProperty("count", 1)
-                        );
-
-                        string requestBody = JsonConvert.SerializeObject(requestBodyJObject);
-
-                        // Send the update
-                        await PatchDataAsync(timelineRecordsUrl, requestBody, authToken);
+                        taskRecord = JObject.FromObject(record);
                         break;
                     }
                 }
+
+                if (taskRecord != null)
+                {
+                    _logger.LogInformation($"Found task record: {taskRecord["id"]}");
+
+                    // Make sure variables property exists
+                    if (taskRecord["variables"] == null)
+                    {
+                        taskRecord["variables"] = new JObject();
+                    }
+
+                    // Set the variable value
+                    JObject variables = (JObject)taskRecord["variables"];
+                    variables[variableName] = new JObject(
+                        new JProperty("value", variableValue),
+                        new JProperty("isSecret", isSecret)
+                    );
+
+                    // Update the record
+                    var updatePayload = new JObject(
+                        new JProperty("value", new JArray(taskRecord)),
+                        new JProperty("count", 1)
+                    );
+
+                    string requestBody = JsonConvert.SerializeObject(updatePayload);
+                    _logger.LogInformation($"Task variable update payload: {requestBody}");
+
+                    var updateResponse = await PatchDataAsync(timelineRecordsUrl, requestBody, authToken);
+                    if (updateResponse.IsSuccessStatusCode)
+                    {
+                        _logger.LogInformation($"Task variable {variableName} set successfully");
+                    }
+                    else
+                    {
+                        var errorContent = await updateResponse.Content.ReadAsStringAsync();
+                        _logger.LogError($"Failed to update task record with variable: {updateResponse.StatusCode}, {errorContent}");
+                    }
+                }
+                else
+                {
+                    _logger.LogError($"Task record not found for ID: {taskInstanceId}");
+                }
+            }
+            else
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogError($"Failed to get timeline records: {response.StatusCode}, {errorContent}");
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError($"Error setting callback variable: {ex.Message}");
-            // Continue processing even if this fails
+            _logger.LogError($"Error setting task variable: {ex.Message}");
+            _logger.LogError(ex.StackTrace);
         }
     }
 
@@ -268,7 +245,7 @@ public class Function1(ILogger<Function1> _logger)
     {
         var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
-        // Important: Use Basic authentication with empty username and auth token as password
+        // Note: Using Basic authentication with empty username and token as password
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
             "Basic",
             Convert.ToBase64String(Encoding.ASCII.GetBytes($":{authToken}"))
@@ -288,7 +265,7 @@ public class Function1(ILogger<Function1> _logger)
     {
         var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
-        // Important: Use Basic authentication with empty username and auth token as password
+        // Note: Using Basic authentication with empty username and token as password
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
             "Basic",
             Convert.ToBase64String(Encoding.ASCII.GetBytes($":{authToken}"))
@@ -311,7 +288,7 @@ public class Function1(ILogger<Function1> _logger)
 
     private async Task<HttpResponseMessage> GetDataAsync(string url, string authToken)
     {
-        // Important: Use Basic authentication with empty username and auth token as password
+        // Note: Using Basic authentication with empty username and token as password
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
             "Basic",
             Convert.ToBase64String(Encoding.ASCII.GetBytes($":{authToken}"))
