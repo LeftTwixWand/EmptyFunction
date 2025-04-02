@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text;
+using Newtonsoft.Json;
 
 namespace FunctionApp1;
 
@@ -22,135 +23,162 @@ public class Function1(ILogger<Function1> _logger)
     [Function("FunctionCallback")]
     public async Task<IActionResult> RunCallback([HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequest req)
     {
-        _logger.LogInformation("C# HTTP trigger function processed a request.");
+        _logger.LogInformation("C# HTTP trigger function processed a request with callback.");
 
-        // Read the request body for header information
-        string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
-        _logger.LogInformation($"Request body: {requestBody}");
-
-        // Check if we need to handle callback by reading headers
-        var planUrl = req.Headers["PlanUrl"].ToString();
-        var projectId = req.Headers["ProjectId"].ToString();
-        var hubName = req.Headers["HubName"].ToString();
-        var planId = req.Headers["PlanId"].ToString();
-        var jobId = req.Headers["JobId"].ToString();
-        var timelineId = req.Headers["TimelineId"].ToString();
-        var taskInstanceId = req.Headers["TaskInstanceId"].ToString();
-        var authToken = req.Headers["AuthToken"].ToString();
-
-        // Log all headers for debugging
-        foreach (var header in req.Headers)
+        try 
         {
-            _logger.LogInformation($"Header: {header.Key} = {header.Value}");
-        }
+            // Read the request body for header information
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            _logger.LogInformation($"Request body: {requestBody}");
 
-        // If all the required headers are present, we're in callback mode
-        if (!string.IsNullOrEmpty(planUrl) &&
-            !string.IsNullOrEmpty(taskInstanceId) &&
-            !string.IsNullOrEmpty(authToken))
-        {
-            _logger.LogInformation("Starting callback process...");
-
-            // Simulate some work
-            await Task.Delay(5000); // 5 seconds delay to simulate work
-
-            // Call back to update the task status
-            await SendCallbackAsync(planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, authToken);
-
-            return new OkObjectResult(new
+            // Extract all headers
+            foreach (var header in req.Headers)
             {
-                message = "Function received successfully. Processing in background. Will update task when complete."
-            });
-        }
+                _logger.LogInformation($"Header: {header.Key} = {header.Value}");
+            }
 
-        // Normal synchronous response
-        return new OkObjectResult("Welcome to Azure Functions!");
-    }
+            // Get required headers
+            var planUrl = req.Headers["PlanUrl"].FirstOrDefault() ?? "";
+            var projectId = req.Headers["ProjectId"].FirstOrDefault() ?? "";
+            var hubName = req.Headers["HubName"].FirstOrDefault() ?? "";
+            var planId = req.Headers["PlanId"].FirstOrDefault() ?? "";
+            var jobId = req.Headers["JobId"].FirstOrDefault() ?? "";
+            var timelineId = req.Headers["TimelineId"].FirstOrDefault() ?? "";
+            var taskInstanceId = req.Headers["TaskInstanceId"].FirstOrDefault() ?? "";
+            var authToken = req.Headers["AuthToken"].FirstOrDefault() ?? "";
 
-    private async Task SendCallbackAsync(
-        string planUrl, string projectId, string hubName,
-        string planId, string jobId, string timelineId,
-        string taskInstanceId, string authToken)
-    {
-        try
-        {
-            _logger.LogInformation($"Sending callback for task: {taskInstanceId}");
-
-            // We need to set a variable at the job level that follows the pattern:
-            // AZURE_FUNCTION_CALLBACK_{taskInstanceId}
-            
-            // Format the callback variable content - EXACT format is critical!
-            string variableValue = JsonSerializer.Serialize(new
+            // Validate required headers
+            if (string.IsNullOrEmpty(planUrl) || 
+                string.IsNullOrEmpty(projectId) || 
+                string.IsNullOrEmpty(hubName) || 
+                string.IsNullOrEmpty(planId) || 
+                string.IsNullOrEmpty(jobId) || 
+                string.IsNullOrEmpty(timelineId) || 
+                string.IsNullOrEmpty(taskInstanceId) || 
+                string.IsNullOrEmpty(authToken))
             {
-                result = "succeeded",
-                resultCode = JsonSerializer.Serialize(new
-                {
-                    status = "success",
-                    message = "Function completed successfully!"
-                })
-            });
+                _logger.LogError("Missing required headers for callback");
+                return new BadRequestObjectResult("Missing required headers for callback");
+            }
 
-            _logger.LogInformation($"Variable value: {variableValue}");
-            
-            // Create a patch operation for the timeline record
-            var timelineRecord = new
+            _logger.LogInformation("Starting callback processing with all required headers");
+            _logger.LogInformation($"TaskInstanceId: {taskInstanceId}");
+
+            // Simulate work
+            await Task.Delay(2000);
+
+            // Set the callback variable directly on the job record
+            bool success = await SetCallbackVariableAsync(
+                planUrl, projectId, hubName, planId, jobId, timelineId, taskInstanceId, authToken);
+
+            if (success)
             {
-                // Use the job ID here since we need to add the variable to the job record
-                id = jobId,
-                variables = new Dictionary<string, object>
-                {
-                    {
-                        $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}",
-                        new
-                        {
-                            value = variableValue,
-                            isSecret = false
-                        }
-                    }
-                }
-            };
-
-            var patchPayload = new
-            {
-                value = new[] { timelineRecord },
-                count = 1
-            };
-
-            string jsonContent = JsonSerializer.Serialize(patchPayload);
-            _logger.LogInformation($"Payload: {jsonContent}");
-
-            // Construct the URL to update the timeline record
-            string apiUrl = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=7.1";
-            _logger.LogInformation($"API URL: {apiUrl}");
-
-            // Create an HTTP request to update the timeline record
-            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
-            
-            // Use PATCH method for updating the timeline record
-            var request = new HttpRequestMessage(new HttpMethod("PATCH"), apiUrl)
-            {
-                Content = content
-            };
-
-            var response = await httpClient.SendAsync(request);
-            string responseContent = await response.Content.ReadAsStringAsync();
-            
-            _logger.LogInformation($"Callback response: {response.StatusCode} - {responseContent}");
-
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogError($"Failed to update timeline record. Status: {response.StatusCode}, Response: {responseContent}");
+                return new OkObjectResult(new { message = "Function executed and callback processed successfully" });
             }
             else
             {
-                _logger.LogInformation("Successfully updated timeline record with callback variable");
+                return new StatusCodeResult(500);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError($"Error sending callback: {ex.Message}");
+            _logger.LogError($"Error in function execution: {ex.Message}");
             _logger.LogError(ex.StackTrace);
+            return new StatusCodeResult(500);
+        }
+    }
+
+    private async Task<bool> SetCallbackVariableAsync(
+        string planUrl, string projectId, string hubName, 
+        string planId, string jobId, string timelineId, 
+        string taskInstanceId, string authToken)
+    {
+        try
+        {
+            // Clear any existing headers
+            httpClient.DefaultRequestHeaders.Clear();
+            
+            // Create the callback variable value - exactly as expected by the task
+            var resultData = new 
+            { 
+                status = "success", 
+                message = "Function completed successfully!" 
+            };
+            
+            // Convert to JSON string
+            string resultJson = JsonConvert.SerializeObject(resultData);
+            
+            // Create the callback value
+            var callbackValue = new 
+            { 
+                result = "succeeded", 
+                resultCode = resultJson 
+            };
+            
+            // Convert to JSON string
+            string callbackJson = JsonConvert.SerializeObject(callbackValue);
+            
+            _logger.LogInformation($"Callback value: {callbackJson}");
+            
+            // Create variable structure
+            var variableValue = new 
+            {
+                value = callbackJson,
+                isSecret = false
+            };
+            
+            // Create variables dictionary with the specific naming pattern
+            var variables = new Dictionary<string, object>
+            {
+                { $"AZURE_FUNCTION_CALLBACK_{taskInstanceId}", variableValue }
+            };
+            
+            // Create the record update
+            var record = new 
+            {
+                id = jobId, // Use the job ID, as we're updating the job-level record
+                variables = variables
+            };
+            
+            // Create the update payload
+            var payload = new 
+            {
+                count = 1,
+                value = new[] { record }
+            };
+            
+            // Convert payload to JSON
+            string jsonContent = JsonConvert.SerializeObject(payload);
+            _logger.LogInformation($"Timeline update payload: {jsonContent}");
+            
+            // Set up the API URL
+            string apiUrl = $"{planUrl.TrimEnd('/')}/{projectId}/_apis/distributedtask/hubs/{hubName}/plans/{planId}/timelines/{timelineId}/records?api-version=7.1";
+            _logger.LogInformation($"Timeline API URL: {apiUrl}");
+            
+            // Set up the request
+            var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+            httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            
+            // Use PATCH method
+            var request = new HttpRequestMessage(new HttpMethod("PATCH"), apiUrl)
+            {
+                Content = content
+            };
+            
+            // Send the request
+            var response = await httpClient.SendAsync(request);
+            string responseContent = await response.Content.ReadAsStringAsync();
+            
+            _logger.LogInformation($"Timeline update response: {response.StatusCode} - {responseContent}");
+            
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error setting callback variable: {ex.Message}");
+            _logger.LogError(ex.StackTrace);
+            return false;
         }
     }
 }
